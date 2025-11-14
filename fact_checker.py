@@ -33,23 +33,6 @@ ENABLE_WEB_SEARCH = True
 SEARCH_CONTEXT_SIZE = "medium"
 ENABLE_STREAMING = True
 
-# Sidebar for API key
-with st.sidebar:
-    st.header("Configuration")
-
-    api_key_input = st.text_input(
-        "OpenAI API Key",
-        type="password",
-        help="Enter your OpenAI API key. Get one at https://platform.openai.com/api-keys"
-    )
-
-    if api_key_input:
-        os.environ["OPENAI_API_KEY"] = api_key_input
-        st.success("✅ API Key set")
-
-    st.divider()
-
-
 # Paste helper to extract links from Google Docs
 paste_helper = """
 <script>
