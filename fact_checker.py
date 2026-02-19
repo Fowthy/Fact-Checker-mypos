@@ -10,8 +10,11 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Initialize OpenAI client
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Initialize OpenRouter client (OpenAI-compatible)
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.getenv("OPENROUTER_API_KEY")
+)
 
 st.set_page_config(page_title="Fact Checker", page_icon="🔍", layout="wide")
 
@@ -26,11 +29,8 @@ if 'fact_check_results' not in st.session_state:
     st.session_state.fact_check_results = None
 
 # Hardcoded model configuration
-MODEL_CHOICE = "gpt-5"
+MODEL_CHOICE = "openai/gpt-5"
 REASONING_EFFORT = "high"
-VERBOSITY = "medium"
-ENABLE_WEB_SEARCH = True
-SEARCH_CONTEXT_SIZE = "medium"
 ENABLE_STREAMING = True
 
 # Paste helper to extract links from Google Docs
@@ -315,8 +315,8 @@ if submit_button:
     current_text = st.session_state.main_text_input
     if not current_text.strip():
         st.error("Please enter some text to fact-check.")
-    elif not os.getenv("OPENAI_API_KEY"):
-        st.error("OpenAI API key not found. Please enter your API key in the sidebar.")
+    elif not os.getenv("OPENROUTER_API_KEY"):
+        st.error("OpenRouter API key not found. Please set OPENROUTER_API_KEY in your .env file.")
     else:
         with st.spinner("Performing deep research and fact-checking..."):
             try:
@@ -378,135 +378,72 @@ Text to fact-check:
 
                 api_params = {
                     "model": MODEL_CHOICE,
-                    "input": [
+                    "messages": [
                         {"role": "system", "content": "You are a professional fact-checker. Analyze texts thoroughly and identify misleading information, questionable statements, and missing context. Always respond in English."},
                         {"role": "user", "content": prompt}
                     ],
-                    "stream": ENABLE_STREAMING
+                    "stream": ENABLE_STREAMING,
+                    "response_format": {
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "fact_check_results",
+                            "strict": True,
+                            "schema": json_schema
+                        }
+                    }
                 }
 
+                extra_body = {}
                 if REASONING_EFFORT:
-                    api_params["reasoning"] = {
+                    extra_body["reasoning"] = {
                         "effort": REASONING_EFFORT,
                         "summary": "auto"
                     }
+                if extra_body:
+                    api_params["extra_body"] = extra_body
 
-                text_config = {}
-                if VERBOSITY:
-                    text_config["verbosity"] = VERBOSITY
-
-                if not ENABLE_STREAMING:
-                    text_config["format"] = {
-                        "type": "json_schema",
-                        "name": "fact_check_results",
-                        "schema": json_schema,
-                        "strict": True
-                    }
-
-                if text_config:
-                    api_params["text"] = text_config
-
-                if ENABLE_WEB_SEARCH:
-                    api_params["tools"] = [{
-                        "type": "web_search",
-                        "user_location": {"type": "approximate"},
-                        "search_context_size": SEARCH_CONTEXT_SIZE
-                    }]
-                    api_params["store"] = True
-                    api_params["include"] = [
-                        "reasoning.encrypted_content",
-                        "web_search_call.action.sources"
-                    ]
-
-                response = client.responses.create(**api_params)
+                response = client.chat.completions.create(**api_params)
 
                 result_text = ""
+                reasoning_text = ""
                 reasoning_and_search_items = []
 
                 if ENABLE_STREAMING:
-                    for event in response:
-                        event_type = getattr(event, 'type', None)
-
-                        if event_type == 'response.output_item.text.delta':
-                            if hasattr(event, 'delta'):
-                                result_text += event.delta
+                    for chunk in response:
+                        if chunk.choices and len(chunk.choices) > 0:
+                            delta = chunk.choices[0].delta
+                            if hasattr(delta, 'reasoning_details') and delta.reasoning_details:
+                                detail = delta.reasoning_details
+                                if isinstance(detail, str):
+                                    reasoning_text += detail
+                                elif isinstance(detail, list):
+                                    for item in detail:
+                                        if isinstance(item, dict) and 'text' in item:
+                                            reasoning_text += item['text']
+                                        elif hasattr(item, 'text'):
+                                            reasoning_text += item.text
+                            if delta and delta.content:
+                                result_text += delta.content
                                 streaming_placeholder.markdown(f"**Live Response:**\n```json\n{result_text}\n```")
 
-                        elif event_type == 'response.completed':
-                            if hasattr(event, 'response'):
-                                resp = event.response
-                                if hasattr(resp, 'output') and resp.output:
-                                    for output_item in resp.output:
-                                        item_type = getattr(output_item, 'type', None)
-
-                                        if item_type == 'reasoning':
-                                            reasoning_text = ""
-                                            if hasattr(output_item, 'summary') and output_item.summary:
-                                                for summary_item in output_item.summary:
-                                                    if hasattr(summary_item, 'text'):
-                                                        reasoning_text += summary_item.text
-                                            if reasoning_text:
-                                                reasoning_and_search_items.append({
-                                                    'type': 'reasoning',
-                                                    'text': reasoning_text
-                                                })
-
-                                        elif item_type == 'web_search_call':
-                                            if hasattr(output_item, 'action'):
-                                                action = output_item.action
-                                                query = getattr(action, 'query', '') if not isinstance(action, dict) else action.get('query', '')
-                                                sources = getattr(action, 'sources', []) if not isinstance(action, dict) else action.get('sources', [])
-
-                                                reasoning_and_search_items.append({
-                                                    'type': 'web_search',
-                                                    'query': query,
-                                                    'sources': sources
-                                                })
-
-                                        elif item_type in ['message', 'output_text']:
-                                            if hasattr(output_item, 'content') and output_item.content and not result_text:
-                                                for content_item in output_item.content:
-                                                    if hasattr(content_item, 'text'):
-                                                        result_text += content_item.text
+                    if reasoning_text:
+                        reasoning_and_search_items.append({
+                            'type': 'reasoning',
+                            'text': reasoning_text
+                        })
 
                     status_placeholder.empty()
                     streaming_placeholder.empty()
                 else:
-                    if hasattr(response, 'output') and response.output:
-                        for output_item in response.output:
-                            item_type = getattr(output_item, 'type', None)
-
-                            if item_type == 'reasoning':
-                                reasoning_text = ""
-                                if hasattr(output_item, 'summary') and output_item.summary:
-                                    for summary_item in output_item.summary:
-                                        if hasattr(summary_item, 'text'):
-                                            reasoning_text += summary_item.text
-                                if reasoning_text:
-                                    reasoning_and_search_items.append({
-                                        'type': 'reasoning',
-                                        'text': reasoning_text
-                                    })
-
-                            elif item_type == 'web_search_call':
-                                if hasattr(output_item, 'action'):
-                                    action = output_item.action
-                                    query = getattr(action, 'query', '') if not isinstance(action, dict) else action.get('query', '')
-                                    sources = getattr(action, 'sources', []) if not isinstance(action, dict) else action.get('sources', [])
-
-                                    reasoning_and_search_items.append({
-                                        'type': 'web_search',
-                                        'query': query,
-                                        'sources': sources
-                                    })
-
-                            elif item_type in ['message', 'output_text']:
-                                if hasattr(output_item, 'content') and output_item.content:
-                                    for content_item in output_item.content:
-                                        if hasattr(content_item, 'text'):
-                                            result_text += content_item.text
-                                elif hasattr(output_item, 'text'):
-                                    result_text += output_item.text
+                    if response.choices and len(response.choices) > 0:
+                        msg = response.choices[0].message
+                        result_text = msg.content or ""
+                        reasoning_content = getattr(msg, 'reasoning', None)
+                        if reasoning_content:
+                            reasoning_and_search_items.append({
+                                'type': 'reasoning',
+                                'text': reasoning_content
+                            })
 
                 # Parse results
                 if not result_text or result_text.strip() == "":
@@ -549,7 +486,7 @@ if st.session_state.fact_check_results is not None:
     reasoning_and_search_items = results['reasoning_and_search_items']
 
     # Display reasoning summary and web searches
-    if model_choice.startswith("gpt-5") and reasoning_and_search_items:
+    if "gpt-5" in model_choice and reasoning_and_search_items:
         with st.expander("🧠 Reasoning Summary & Web Search", expanded=True):
             search_counter = 0
             for item in reasoning_and_search_items:
