@@ -2,19 +2,16 @@ import streamlit as st
 import streamlit.components.v1 as components
 import os
 import json
-import re
+import time
 import traceback
-from openai import OpenAI
+from datetime import datetime, timezone
 from dotenv import load_dotenv
+
+from excerpt_align import align_issue_excerpts, find_excerpt_ranges
+from fact_check_request import build_fact_check_body, stream_fact_check
 
 # Load environment variables
 load_dotenv()
-
-# Initialize OpenRouter client (OpenAI-compatible)
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.getenv("OPENROUTER_API_KEY")
-)
 
 st.set_page_config(page_title="Fact Checker", page_icon="🔍", layout="wide")
 
@@ -28,10 +25,21 @@ if 'main_text_input' not in st.session_state:
 if 'fact_check_results' not in st.session_state:
     st.session_state.fact_check_results = None
 
-# Hardcoded model configuration
-MODEL_CHOICE = "openai/gpt-5"
-REASONING_EFFORT = "high"
-ENABLE_STREAMING = True
+# Only models with a zero-data-retention endpoint on OpenRouter: the key runs under the
+# "Company data: zero data retention" guardrail, which rejects every request to any other model.
+FACT_CHECK_MODELS = [
+    "openai/gpt-6.1-terra",
+    "openai/gpt-6.1-sol",
+    "openai/gpt-6-luna",
+    "google/gemini-4-hydrogen",
+    "anthropic/claude-sonnet-5.5",
+    "openai/gpt-5",
+]
+MODEL_CHOICE = os.getenv("FACT_CHECK_MODEL", "openai/gpt-6.1-terra")
+
+if MODEL_CHOICE not in FACT_CHECK_MODELS:
+    st.error(f"FACT_CHECK_MODEL '{MODEL_CHOICE}' is not supported. Use one of: {', '.join(FACT_CHECK_MODELS)}.")
+    st.stop()
 
 # Paste helper to extract links from Google Docs
 paste_helper = """
@@ -128,25 +136,6 @@ st.text_area(
 submit_button = st.button("Fact Check", type="primary")
 
 
-def build_position_map(text):
-    """Build mapping from stripped text (no URLs) to original text positions"""
-    stripped = []
-    position_map = []
-    i = 0
-
-    while i < len(text):
-        url_match = re.match(r'\s*\(https?://[^\)]+\)', text[i:])
-        if url_match:
-            i += len(url_match.group())
-            continue
-
-        stripped.append(text[i])
-        position_map.append(i)
-        i += 1
-
-    return ''.join(stripped), position_map
-
-
 def highlight_text(original_text, issues, show_misleading=True, show_incomplete=True, show_questionable=True):
     """Highlight problematic sections in the text with overlapping support"""
     if not issues:
@@ -169,8 +158,6 @@ def highlight_text(original_text, issues, show_misleading=True, show_incomplete=
 
     if not filtered_issues:
         return original_text
-
-    original_stripped, pos_map = build_position_map(original_text)
 
     colors = {
         'misleading': '#ffcccc',
@@ -197,27 +184,7 @@ def highlight_text(original_text, issues, show_misleading=True, show_incomplete=
         sources = issue.get('sources', [])
         original_idx = issue.get('_original_index', 0)
 
-        start_pos = None
-        end_pos = None
-
-        # Try exact match
-        pos = original_text.find(excerpt)
-        if pos != -1:
-            start_pos = pos
-            end_pos = pos + len(excerpt)
-        else:
-            # Try stripped text match
-            excerpt_stripped, _ = build_position_map(excerpt)
-            pos = original_stripped.find(excerpt_stripped)
-
-            if pos != -1 and len(excerpt_stripped) > 0:
-                start_pos = pos_map[pos]
-                end_pos_stripped = min(pos + len(excerpt_stripped), len(pos_map))
-
-                if end_pos_stripped > 0 and end_pos_stripped <= len(pos_map):
-                    end_pos = pos_map[end_pos_stripped - 1] + 1
-
-        if start_pos is not None and end_pos is not None:
+        for start_pos, end_pos in find_excerpt_ranges(original_text, excerpt):
             highlight_ranges.append({
                 'start': start_pos,
                 'end': end_pos,
@@ -318,163 +285,57 @@ if submit_button:
     elif not os.getenv("OPENROUTER_API_KEY"):
         st.error("OpenRouter API key not found. Please set OPENROUTER_API_KEY in your .env file.")
     else:
-        with st.spinner("Performing deep research and fact-checking..."):
-            try:
-                prompt = f"""
-Run a deep research to fact check this text. Identify any misleading information, questionable statements, or missing important information that would confuse the reader.
+        status_placeholder = st.empty()
+        search_placeholder = st.empty()
+        started_at = time.monotonic()
+        searches_so_far = []
+        status_placeholder.info("Performing deep research and fact-checking...")
 
-CRITICAL INSTRUCTIONS:
-1. Respond in English
-2. For the "excerpt" field: You MUST copy-paste the EXACT text from the original that has the issue. DO NOT write your own summary or commentary.
-3. If information is MISSING (incomplete), you can describe what's missing in the "issue" field, but leave "excerpt" empty or put a relevant sentence that should have more detail.
-4. Only include issues where you can point to specific problematic text OR identify specific gaps.
+        def show_search(search):
+            searches_so_far.append(search)
+            status_placeholder.info(f"Performing deep research and fact-checking... {len(searches_so_far)} web searches so far")
+            with search_placeholder.container():
+                with st.expander("🧠 Reasoning Summary & Web Search", expanded=True):
+                    for number, done in enumerate(searches_so_far, 1):
+                        st.markdown(f"**🔍 Web Search {number}:** {done['query']} ({len(done['sources'])} sources)")
 
-Return your analysis as a JSON object with the following structure:
-{{
-"issues": [
-    {{
-    "excerpt": "EXACT TEXT copied from the original (not your summary)",
-    "issue": "explanation of what is wrong, misleading, or missing",
-    "type": "misleading" | "questionable" | "incomplete",
-    "sources": ["URL or source 1", "URL or source 2"]
-    }}
-],
-"all_sources": ["list", "of", "all", "sources", "used"]
-}}
+        try:
+            body = build_fact_check_body(MODEL_CHOICE, current_text, datetime.now(timezone.utc))
+            run = stream_fact_check(os.getenv("OPENROUTER_API_KEY"), body, show_search)
 
-For each issue, provide the sources you used to verify the information. Include ALL sources at the end in the all_sources array.
+            result_json = json.loads(run['text'])
+            alignment = align_issue_excerpts(
+                current_text, result_json.get('issues', []), MODEL_CHOICE, os.getenv("OPENROUTER_API_KEY")
+            )
+            if alignment['repair_error']:
+                st.warning(f"Excerpt repair failed: {alignment['repair_error']}")
 
-If no issues are found, return: {{"issues": [], "all_sources": []}}
+            reasoning_and_search_items = []
+            if run['reasoning']:
+                reasoning_and_search_items.append({'type': 'reasoning', 'text': run['reasoning']})
+            reasoning_and_search_items += [{'type': 'web_search', **search} for search in run['searches']]
 
-Text to fact-check:
-{current_text}
-"""
+            repair_cost = (alignment['repair_usage'] or {}).get('cost') or 0
+            status_placeholder.empty()
+            search_placeholder.empty()
+            st.success("Fact-check complete!")
 
-                json_schema = {
-                    "type": "object",
-                    "properties": {
-                        "issues": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "excerpt": {"type": "string"},
-                                    "issue": {"type": "string"},
-                                    "type": {"type": "string", "enum": ["misleading", "questionable", "incomplete"]},
-                                    "sources": {"type": "array", "items": {"type": "string"}}
-                                },
-                                "required": ["excerpt", "issue", "type", "sources"],
-                                "additionalProperties": False
-                            }
-                        },
-                        "all_sources": {"type": "array", "items": {"type": "string"}}
-                    },
-                    "required": ["issues", "all_sources"],
-                    "additionalProperties": False
-                }
+            st.session_state.fact_check_results = {
+                'issues': alignment['issues'],
+                'all_sources': result_json.get('all_sources', []),
+                'current_text': current_text,
+                'reasoning_and_search_items': reasoning_and_search_items,
+                'cost': (run['usage'].get('cost') or 0) + repair_cost,
+                'search_count': len(run['searches']),
+                'duration': time.monotonic() - started_at
+            }
 
-                status_placeholder = st.empty()
-                streaming_placeholder = st.empty()
-
-                api_params = {
-                    "model": MODEL_CHOICE,
-                    "messages": [
-                        {"role": "system", "content": "You are a professional fact-checker. Analyze texts thoroughly and identify misleading information, questionable statements, and missing context. Always respond in English."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    "stream": ENABLE_STREAMING,
-                    "response_format": {
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": "fact_check_results",
-                            "strict": True,
-                            "schema": json_schema
-                        }
-                    }
-                }
-
-                extra_body = {}
-                if REASONING_EFFORT:
-                    extra_body["reasoning"] = {
-                        "effort": REASONING_EFFORT,
-                        "summary": "auto"
-                    }
-                if extra_body:
-                    api_params["extra_body"] = extra_body
-
-                response = client.chat.completions.create(**api_params)
-
-                result_text = ""
-                reasoning_text = ""
-                reasoning_and_search_items = []
-
-                if ENABLE_STREAMING:
-                    for chunk in response:
-                        if chunk.choices and len(chunk.choices) > 0:
-                            delta = chunk.choices[0].delta
-                            if hasattr(delta, 'reasoning_details') and delta.reasoning_details:
-                                detail = delta.reasoning_details
-                                if isinstance(detail, str):
-                                    reasoning_text += detail
-                                elif isinstance(detail, list):
-                                    for item in detail:
-                                        if isinstance(item, dict) and 'text' in item:
-                                            reasoning_text += item['text']
-                                        elif hasattr(item, 'text'):
-                                            reasoning_text += item.text
-                            if delta and delta.content:
-                                result_text += delta.content
-                                streaming_placeholder.markdown(f"**Live Response:**\n```json\n{result_text}\n```")
-
-                    if reasoning_text:
-                        reasoning_and_search_items.append({
-                            'type': 'reasoning',
-                            'text': reasoning_text
-                        })
-
-                    status_placeholder.empty()
-                    streaming_placeholder.empty()
-                else:
-                    if response.choices and len(response.choices) > 0:
-                        msg = response.choices[0].message
-                        result_text = msg.content or ""
-                        reasoning_content = getattr(msg, 'reasoning', None)
-                        if reasoning_content:
-                            reasoning_and_search_items.append({
-                                'type': 'reasoning',
-                                'text': reasoning_content
-                            })
-
-                # Parse results
-                if not result_text or result_text.strip() == "":
-                    st.error("No response received from the API. Please check your API key and model availability.")
-                    issues = []
-                    all_sources = []
-                else:
-                    result_json = json.loads(result_text)
-                    if isinstance(result_json, dict):
-                        issues = result_json.get('issues', [])
-                        all_sources = result_json.get('all_sources', [])
-                    else:
-                        issues = result_json
-                        all_sources = []
-
-                st.success("Fact-check complete!")
-
-                st.session_state.fact_check_results = {
-                    'issues': issues,
-                    'all_sources': all_sources,
-                    'current_text': current_text,
-                    'model_choice': MODEL_CHOICE,
-                    'reasoning_and_search_items': reasoning_and_search_items
-                }
-
-            except json.JSONDecodeError as e:
-                st.error(f"Failed to parse fact-check results. Error: {str(e)}")
-            except Exception as e:
-                st.error(f"Error: {str(e)}")
-                with st.expander("Show error details"):
-                    st.code(traceback.format_exc())
+        except json.JSONDecodeError as e:
+            st.error(f"Failed to parse fact-check results. Error: {str(e)}")
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
+            with st.expander("Show error details"):
+                st.code(traceback.format_exc())
 
 # Display results from session state
 if st.session_state.fact_check_results is not None:
@@ -482,11 +343,10 @@ if st.session_state.fact_check_results is not None:
     issues = results['issues']
     all_sources = results['all_sources']
     current_text = results['current_text']
-    model_choice = results['model_choice']
     reasoning_and_search_items = results['reasoning_and_search_items']
 
     # Display reasoning summary and web searches
-    if "gpt-5" in model_choice and reasoning_and_search_items:
+    if reasoning_and_search_items:
         with st.expander("🧠 Reasoning Summary & Web Search", expanded=True):
             search_counter = 0
             for item in reasoning_and_search_items:
@@ -496,20 +356,14 @@ if st.session_state.fact_check_results is not None:
 
                 elif item['type'] == 'web_search':
                     search_counter += 1
-                    query = item.get('query', '')
-                    sources = item.get('sources', [])
+                    query = item['query']
+                    sources = item['sources']
 
                     st.markdown("---")
-                    if query:
-                        st.markdown(f"**🔍 Web Search {search_counter}:** {query}")
-                    else:
-                        st.markdown(f"**🔍 Web Search {search_counter}**")
+                    st.markdown(f"**🔍 Web Search {search_counter}:** {query} ({len(sources)} sources)")
 
-                    if sources:
-                        for idx, source in enumerate(sources, 1):
-                            url = source.get('url', '') if isinstance(source, dict) else (source.url if hasattr(source, 'url') else str(source))
-                            if url:
-                                st.markdown(f"{idx}. [{url}]({url})")
+                    for idx, source in enumerate(sources, 1):
+                        st.markdown(f"{idx}. [{source['url']}]({source['url']})")
 
                     st.markdown("")
 
@@ -800,4 +654,4 @@ if st.session_state.fact_check_results is not None:
                 else:
                     st.markdown(f"{idx}. {source}")
 
-
+    st.caption(f"Cost: ${results['cost']:.3f} · {results['search_count']} web searches · {results['duration']:.0f}s")
