@@ -42,45 +42,296 @@ if MODEL_CHOICE not in FACT_CHECK_MODELS:
     st.stop()
 
 # Paste helper to extract links from Google Docs
-paste_helper = """
+paste_helper = r"""
 <script>
-function parseHtmlWithLinks(html) {
-    const parser = new DOMParser();
-    const doc = parser.parseFromString(html, 'text/html');
+const namedEntities = {
+  nbsp: " ",
+  amp: "&",
+  lt: "<",
+  gt: ">",
+  quot: '"',
+  apos: "'",
+  shy: "",
+  laquo: "«",
+  raquo: "»",
+  ndash: "–",
+  mdash: "—",
+  hellip: "…",
+  bdquo: "„",
+  ldquo: "“",
+  rdquo: "”",
+  sbquo: "‚",
+  lsquo: "‘",
+  rsquo: "’",
+  middot: "·",
+  bull: "•",
+  copy: "©",
+  reg: "®",
+  trade: "™",
+  euro: "€",
+  deg: "°",
+  sect: "§",
+  acirc: "â",
+  Acirc: "Â",
+  icirc: "î",
+  Icirc: "Î",
+  abreve: "ă",
+  Abreve: "Ă",
+  scedil: "ş",
+  Scedil: "Ş",
+  tcedil: "ţ",
+  Tcedil: "Ţ",
+};
 
-    function processNode(node) {
-        if (node.nodeType === Node.TEXT_NODE) {
-            return node.textContent;
-        }
+/** Elements that end a paragraph and leave an empty line before the next block. */
+const gapTags = new Set(["p", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre", "ul", "ol", "table", "hr"]);
 
-        if (node.nodeType === Node.ELEMENT_NODE) {
-            if (node.tagName === 'A' && node.href) {
-                return `${node.textContent} (${node.href})`;
-            }
+/** Elements that only start a new line. */
+const lineTags = new Set([
+  "br", "div", "section", "article", "header", "footer", "main", "aside", "nav", "figure", "figcaption",
+  "li", "tr", "dl", "dt", "dd", "tbody", "thead", "tfoot", "caption", "form", "address", "details", "summary",
+  "fieldset", "center",
+]);
 
-            if (node.tagName === 'BR') {
-                return '\\n';
-            }
+const tokenPattern =
+  /<!--[\s\S]*?-->|<[!?][^>]*>|<(\/?)([a-zA-Z][\w:.-]*)((?:"[^"]*"|'[^']*'|[^>"'])*)>|([^<]+|<)/g;
 
-            if (['P', 'DIV', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'LI'].includes(node.tagName)) {
-                let text = '';
-                for (let child of node.childNodes) {
-                    text += processNode(child);
-                }
-                return text + '\\n';
-            }
-
-            let text = '';
-            for (let child of node.childNodes) {
-                text += processNode(child);
-            }
-            return text;
-        }
-        return '';
+/** @param {string} value */
+function decodeEntities(value) {
+  return value.replace(/&(#x[0-9a-f]+|#\d+|[a-z][a-z0-9]*);/gi, (match, name) => {
+    if (name[0] === "#") {
+      const codePoint = name[1] === "x" || name[1] === "X" ? parseInt(name.slice(2), 16) : parseInt(name.slice(1), 10);
+      const isSurrogate = codePoint >= 0xd800 && codePoint <= 0xdfff;
+      return codePoint > 0 && codePoint <= 0x10ffff && !isSurrogate ? String.fromCodePoint(codePoint) : match;
     }
+    return Object.hasOwn(namedEntities, name) ? namedEntities[name] : match;
+  });
+}
 
-    let result = processNode(doc.body);
-    return result.replace(/\\n{3,}/g, '\\n\\n').trim();
+/**
+ * @param {string} attributes
+ * @param {string} name
+ * @returns {string | null}
+ */
+function getAttribute(attributes, name) {
+  const match = new RegExp(`\\s${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'>]+))`, "i").exec(attributes);
+  if (!match) return null;
+  return decodeEntities(match[1] ?? match[2] ?? match[3] ?? "").trim();
+}
+
+/**
+ * Resolve an href to an absolute http(s) URL, unwrapping Google redirect links.
+ * Returns null for in-page anchors, mailto:, tel:, javascript: and anything unresolvable.
+ *
+ * @param {string | null} href
+ * @param {string | undefined} baseUrl
+ * @returns {string | null}
+ */
+function resolveHref(href, baseUrl) {
+  if (!href || href.startsWith("#")) return null;
+  let url;
+  try {
+    url = new URL(href, baseUrl);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+
+  if (/(^|\.)google\.[a-z.]+$/i.test(url.hostname) && url.pathname === "/url") {
+    const target = url.searchParams.get("q") ?? url.searchParams.get("url");
+    if (target) {
+      try {
+        const real = new URL(target);
+        if (real.protocol === "http:" || real.protocol === "https:") return real.href;
+      } catch {
+        return url.href;
+      }
+    }
+  }
+  return url.href;
+}
+
+/** @param {string} value */
+function comparableUrl(value) {
+  return value.trim().replace(/^https?:\/\//i, "").replace(/\/+$/, "").toLowerCase();
+}
+
+/** @param {string | null} value */
+function isTinyDimension(value) {
+  if (value === null) return false;
+  const size = parseInt(value, 10);
+  return Number.isFinite(size) && size <= 2;
+}
+
+/**
+ * True when the clipboard HTML carries something plain text would lose:
+ * an image or a link with an http(s) or relative href.
+ *
+ * @param {string} html
+ * @returns {boolean}
+ */
+function hasLinkOrImage(html) {
+  if (/<img\b/i.test(html)) return true;
+  for (const match of html.matchAll(/<a\b[^>]*\shref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi)) {
+    const href = (match[1] ?? match[2] ?? match[3] ?? "").trim();
+    if (/^https?:/i.test(href)) return true;
+    if (href !== "" && !/^(?:#|[a-z][a-z0-9+.-]*:)/i.test(href)) return true;
+  }
+  return false;
+}
+
+/**
+ * Convert HTML to plain text that keeps links as `text (URL)` and images as `[Image: alt]`.
+ *
+ * @param {string} html
+ * @param {string} [baseUrl] used to resolve relative hrefs
+ * @returns {string}
+ */
+function htmlToText(html, baseUrl) {
+  const source = html
+    .replace(/<!--[\s\S]*?-->/g, "")
+    .replace(/<!\[if !supportLists\]>[\s\S]*?<!\[endif\]>/gi, "- ")
+    .replace(/<(script|style|noscript|template|head|svg|xml)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, "");
+
+  /** @type {string[]} */
+  const lines = [];
+  let buffer = "";
+  let pendingPrefix = "";
+  let pendingGap = false;
+  let listDepth = 0;
+  let cellsInRow = 0;
+  /** @type {{ url: string | null, text: string } | null} */
+  let link = null;
+
+  /** @param {string} line */
+  function pushLine(line) {
+    if (pendingGap && lines.length > 0) lines.push("");
+    pendingGap = false;
+    lines.push(line);
+  }
+
+  function newline() {
+    const line = buffer.trim();
+    buffer = "";
+    if (line) pushLine(line);
+  }
+
+  function gap() {
+    newline();
+    pendingGap = true;
+  }
+
+  /** @param {string} piece */
+  function put(piece) {
+    if (buffer === "") {
+      buffer = pendingPrefix + piece;
+      pendingPrefix = "";
+    } else {
+      buffer += piece;
+    }
+  }
+
+  /** @param {string} piece */
+  function append(piece) {
+    put(buffer === "" || buffer.endsWith(" ") ? piece : ` ${piece}`);
+  }
+
+  /** @param {string} raw */
+  function addText(raw) {
+    let piece = decodeEntities(raw).replace(/\s+/g, " ");
+    if (piece.startsWith(" ") && (buffer === "" || buffer.endsWith(" "))) piece = piece.slice(1);
+    if (!piece) return;
+    put(piece);
+    if (link) link.text += piece;
+  }
+
+  function closeLink() {
+    if (!link) return;
+    const { url, text } = link;
+    link = null;
+    if (!url) return;
+
+    const label = text.trim();
+    if (!label) {
+      append(url);
+    } else if (comparableUrl(label) !== comparableUrl(url)) {
+      const trailingSpace = text.endsWith(" ") && buffer.endsWith(" ");
+      buffer = buffer.trimEnd();
+      append(`(${url})`);
+      if (trailingSpace) buffer += " ";
+    }
+  }
+
+  /**
+   * @param {string} attributes
+   */
+  function addImage(attributes) {
+    const src = getAttribute(attributes, "src") ?? "";
+    const isTinyData = /^data:/i.test(src) && src.length < 200;
+    if (isTinyDimension(getAttribute(attributes, "width")) || isTinyDimension(getAttribute(attributes, "height")) || isTinyData) {
+      return;
+    }
+    const alt = (getAttribute(attributes, "alt") ?? "").replace(/\s+/g, " ").trim();
+    newline();
+    pushLine(alt ? `[Image: ${alt}]` : "[Image]");
+  }
+
+  for (const match of source.matchAll(tokenPattern)) {
+    const [, closing, rawName, attributes, text] = match;
+    if (text !== undefined) {
+      addText(text);
+      continue;
+    }
+    if (!rawName) continue;
+
+    const name = rawName.toLowerCase();
+    const isClosing = closing === "/";
+
+    if (name === "a") {
+      closeLink();
+      if (!isClosing) {
+        link = { url: resolveHref(getAttribute(attributes, "href"), baseUrl), text: "" };
+      }
+      continue;
+    }
+    if (name === "img") {
+      if (!isClosing) addImage(attributes);
+      continue;
+    }
+    if (name === "ul" || name === "ol") {
+      if (isClosing) listDepth = Math.max(0, listDepth - 1);
+      if (listDepth > 0) newline();
+      else gap();
+      if (!isClosing) listDepth += 1;
+      continue;
+    }
+    if (name === "li") {
+      newline();
+      pendingPrefix = isClosing ? "" : "- ";
+      continue;
+    }
+    if (name === "td" || name === "th") {
+      if (!isClosing && cellsInRow++ > 0) {
+        buffer = buffer.trimEnd() + " | ";
+      }
+      continue;
+    }
+    if (name === "tr") {
+      newline();
+      cellsInRow = 0;
+      continue;
+    }
+    if (gapTags.has(name)) {
+      if (listDepth > 0 && name !== "table") newline();
+      else gap();
+      continue;
+    }
+    if (lineTags.has(name)) newline();
+  }
+
+  closeLink();
+  newline();
+  return lines.join("\n");
 }
 
 function attachPasteHandler() {
@@ -94,10 +345,10 @@ function attachPasteHandler() {
             const clipboardData = e.clipboardData || window.clipboardData;
             const htmlData = clipboardData.getData('text/html');
 
-            if (htmlData && htmlData.includes('<a')) {
+            if (htmlData && hasLinkOrImage(htmlData)) {
                 e.preventDefault();
 
-                const processedText = parseHtmlWithLinks(htmlData);
+                const processedText = htmlToText(htmlData);
                 const start = textarea.selectionStart;
                 const end = textarea.selectionEnd;
                 const currentValue = textarea.value;
@@ -129,7 +380,7 @@ components.html(paste_helper, height=0)
 st.text_area(
     "",
     height=300,
-    placeholder="Paste your text here (links from Google Docs will be preserved automatically)...",
+    placeholder="Paste your text here (links and images from Google Docs are kept automatically)...",
     key="main_text_input"
 )
 
