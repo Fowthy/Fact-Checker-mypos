@@ -116,13 +116,16 @@ def stream_fact_check(api_key, body, on_search):
                     }
                     searches.append(search)
                     on_search(search)
-            elif event_type in ("response.failed", "response.incomplete"):
-                failed = event.get("response", {})
+            elif event_type in ("response.failed", "response.incomplete", "error"):
+                # The Responses API puts the reason in response.error; a bare "error" event carries it at the top level.
+                failed = event.get("response") or {}
                 raise RuntimeError(
-                    (failed.get("status_details") or {}).get("error", {}).get("message")
+                    (failed.get("error") or {}).get("message")
+                    or (failed.get("status_details") or {}).get("error", {}).get("message")
                     or (failed.get("incomplete_details") or {}).get("reason")
                     or (event.get("error") or {}).get("message")
-                    or "AI model returned an error"
+                    or event.get("message")
+                    or f"AI model returned an error ({event_type})"
                 )
             elif event_type in ("response.completed", "response.done"):
                 completed = event.get("response", {})
